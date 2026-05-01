@@ -126,7 +126,9 @@ Install PyInstaller:
 pip install pyinstaller
 
 Basic build:
-pyinstaller --onefile --windowed --name AlienEncryption main.py
+```bash
+pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.png;." --name "AlienEncryption" main.py
+```
 
 With custom icon:
 pyinstaller --onefile --windowed --icon=icon.ico --name AlienEncryption main.py
