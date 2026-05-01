@@ -137,13 +137,6 @@ pyinstaller --onefile --windowed --icon=icon.ico --name "AlienEncryption" main.p
 
 Executable will be in the dist folder.
 
-To reduce file size, use virtual environment:
-```bash
-python -m venv build_env
-build_env\Scripts\activate
-pip install PyQt6 cryptography pyinstaller
-pyinstaller --onefile --windowed --clean --name AlienEncryption main.py
-```
 
 ## Security Notes
 
