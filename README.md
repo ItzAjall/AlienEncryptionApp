@@ -87,7 +87,7 @@ Quick tips:
 - Use Swap button to switch Input and Output
 - Password strength indicator shows weak, medium, or strong
 - For hex keys, enter exactly 64 characters
-"@ | Out-File -FilePath README.md -Append -Encoding UTF8@"
+- Out-File -FilePath README.md -Append -Encoding UTF8@"
 
 ### Asymmetric Tab
 
@@ -118,7 +118,7 @@ Decrypting:
 3. Click Decrypt
 
 File operations work the same as AES tab.
-"@ | Out-File -FilePath README.md -Append -Encoding UTF8@"
+Out-File -FilePath README.md -Append -Encoding UTF8@"
 
 ## Export to EXE
 
