@@ -46,15 +46,13 @@ Prerequisites: Python 3.8 or higher
 
 Install dependencies:
 ```bash
-pip install PyQt6 cryptography
-```
-or
-```bash
 pip install -r requirements.txt
 ```
 
 Run the application:
+```bash
 python main.py
+```
 
 ## How to Use
 
@@ -118,28 +116,34 @@ Decrypting:
 3. Click Decrypt
 
 File operations work the same as AES tab.
-Out-File -FilePath README.md -Append -Encoding UTF8@"
+
 
 ## Export to EXE
 
 Install PyInstaller:
+```bash
 pip install pyinstaller
+```
 
 Basic build:
 ```bash
-pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.png;." --name "AlienEncryption" main.py
+pyinstaller --onefile --windowed main.py
 ```
 
 With custom icon:
-pyinstaller --onefile --windowed --icon=icon.ico --name AlienEncryption main.py
+```bash
+pyinstaller --onefile --windowed --icon=icon.ico --name "AlienEncryption" main.py
+```
 
 Executable will be in the dist folder.
 
 To reduce file size, use virtual environment:
+```bash
 python -m venv build_env
 build_env\Scripts\activate
 pip install PyQt6 cryptography pyinstaller
 pyinstaller --onefile --windowed --clean --name AlienEncryption main.py
+```
 
 ## Security Notes
 
@@ -154,4 +158,3 @@ pyinstaller --onefile --windowed --clean --name AlienEncryption main.py
 MIT License
 
 REMEMBER: Use at your own risk. Always back up your data and keys.
-"@ | Out-File -FilePath README.md -Append -Encoding UTF8
