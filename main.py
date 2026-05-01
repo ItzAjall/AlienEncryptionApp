@@ -9,16 +9,20 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QLineEdit, QTextEdit, QPushButton,
     QComboBox, QFileDialog, QMessageBox, QFrame, QSizePolicy,
-    QSpacerItem, QRadioButton, QButtonGroup, QProgressBar
+    QSpacerItem, QRadioButton, QButtonGroup, QProgressBar, QCheckBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QRunnable, QThreadPool
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread
+from PyQt6.QtGui import QFont, QIcon, QScreen
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec, ed25519
-from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec
+from cryptography.hazmat.primitives import serialization, hashes, hmac
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 
 class VexarScript:
@@ -75,237 +79,315 @@ class VexarScript:
 
 
 class AESCrypto:
-    KEY_LEN, NONCE_LEN = 32, 12
-    SALT_LEN = 16
+    NONCE_LEN = 12
+    CHUNK_SIZE = 64 * 1024 * 1024  # 64MB chunks for large files
+    MAX_GCM_SIZE = 2**31 - 1  # ~2GB limit for single GCM operation
     
     @staticmethod
-    def generate_key():
-        return secrets.token_bytes(32)
+    def generate_key(): return secrets.token_bytes(32)
     
     @staticmethod
     def derive_key(password: str, salt: bytes = None) -> tuple:
-        if salt is None:
-            salt = secrets.token_bytes(AESCrypto.SALT_LEN)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(), length=32, salt=salt,
-            iterations=600000, backend=default_backend()
-        )
-        key = kdf.derive(password.encode())
-        return key, salt
+        if salt is None: salt = secrets.token_bytes(16)
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000, backend=default_backend())
+        return kdf.derive(password.encode()), salt
     
     @classmethod
-    def encrypt_text(cls, text: str, key: bytes, use_alien: bool = True) -> str:
+    def encrypt_text(cls, text: str, key: bytes, use_alien: bool = True, one_time: bool = False) -> str:
         aesgcm = AESGCM(key)
-        nonce = secrets.token_bytes(cls.NONCE_LEN)
-        ct = aesgcm.encrypt(nonce, text.encode(), None)
-        combined = nonce + ct
-        b64 = base64.b64encode(combined).decode()
-        if use_alien:
-            hex_str = b64.encode().hex()
-            return VexarScript.encode(hex_str)
-        return b64
+        nonce = secrets.token_bytes(12)
+        associated_data = b"one_time" if one_time else b""
+        ct = aesgcm.encrypt(nonce, text.encode(), associated_data)
+        result = nonce + ct
+        if one_time:
+            result = b"\x01" + result  # Prefix to indicate one-time
+        else:
+            result = b"\x00" + result  # Prefix to indicate reusable
+        b64 = base64.b64encode(result).decode()
+        return VexarScript.encode(b64.encode().hex()) if use_alien else b64
     
     @classmethod
     def decrypt_text(cls, text: str, key: bytes, use_alien: bool = True) -> Optional[str]:
-        if use_alien:
-            hex_str = VexarScript.decode(text)
-            if not hex_str: return None
-            try:
-                b64 = bytes.fromhex(hex_str).decode()
-            except:
-                return None
-        else:
-            b64 = text
         try:
-            combined = base64.b64decode(b64)
-            nonce, ct = combined[:cls.NONCE_LEN], combined[cls.NONCE_LEN:]
+            if use_alien:
+                h = VexarScript.decode(text)
+                if not h: return None
+                b64 = bytes.fromhex(h).decode()
+            else:
+                b64 = text
+            data = base64.b64decode(b64)
+            one_time = data[0] == 1
             aesgcm = AESGCM(key)
-            return aesgcm.decrypt(nonce, ct, None).decode()
-        except:
-            return None
+            associated_data = b"one_time" if one_time else b""
+            return aesgcm.decrypt(data[1:13], data[13:], associated_data).decode()
+        except: return None
     
     @classmethod
-    def encrypt_file(cls, filepath: str, key: bytes) -> bytes:
-        aesgcm = AESGCM(key)
-        nonce = secrets.token_bytes(cls.NONCE_LEN)
+    def encrypt_file(cls, filepath: str, key: bytes, progress_callback=None) -> bytes:
+        """Chunked AES-GCM encryption for files of any size"""
+        file_size = os.path.getsize(filepath)
+        
+        # Generate master key components using HKDF
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=None, info=b'file-encryption', backend=default_backend())
+        key_material = hkdf.derive(key)
+        enc_key = key_material[:32]
+        mac_key = key_material[32:]
+        
+        result = bytearray()
+        result.extend(b"AESGCM_CHUNKED")  # 16 byte header
+        result.extend(secrets.token_bytes(16))  # Random file ID
+        
+        chunk_index = 0
+        processed = 0
+        
+        # Calculate number of chunks
+        total_chunks = (file_size + cls.CHUNK_SIZE - 1) // cls.CHUNK_SIZE
+        
         with open(filepath, 'rb') as f:
-            data = f.read()
-        ct = aesgcm.encrypt(nonce, data, None)
-        return nonce + ct
+            while True:
+                chunk = f.read(cls.CHUNK_SIZE)
+                if not chunk: break
+                
+                # Derive unique key for this chunk
+                chunk_info = chunk_index.to_bytes(8, 'big')
+                chunk_kdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=mac_key, info=chunk_info, backend=default_backend())
+                chunk_key = chunk_kdf.derive(enc_key)
+                
+                # Generate unique nonce
+                nonce = hashlib.sha256(chunk_info + key).digest()[:12]
+                
+                # Encrypt chunk with GCM
+                aesgcm = AESGCM(chunk_key)
+                ct = aesgcm.encrypt(nonce, chunk, chunk_info)
+                
+                # Store: chunk_index (8) + nonce (12) + ciphertext
+                result.extend(chunk_index.to_bytes(8, 'big'))
+                result.extend(nonce)
+                result.extend(ct)
+                
+                chunk_index += 1
+                processed += len(chunk)
+                if progress_callback:
+                    progress_callback(int(processed * 100 / file_size))
+        
+        # HMAC over entire result
+        h = hmac.HMAC(mac_key, hashes.SHA256(), backend=default_backend())
+        h.update(bytes(result))
+        result.extend(h.finalize())
+        
+        return bytes(result)
     
     @classmethod
-    def decrypt_file(cls, encrypted_data: bytes, key: bytes) -> bytes:
-        nonce = encrypted_data[:cls.NONCE_LEN]
-        ct = encrypted_data[cls.NONCE_LEN:]
-        aesgcm = AESGCM(key)
-        return aesgcm.decrypt(nonce, ct, None)
+    def decrypt_file(cls, data: bytes, key: bytes, progress_callback=None) -> bytes:
+        """Chunked AES-GCM decryption"""
+        # Verify and extract
+        mac_tag = data[-32:]
+        payload = data[:-32]
+        
+        # Derive keys
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=None, info=b'file-encryption', backend=default_backend())
+        key_material = hkdf.derive(key)
+        enc_key = key_material[:32]
+        mac_key = key_material[32:]
+        
+        # Verify integrity
+        h = hmac.HMAC(mac_key, hashes.SHA256(), backend=default_backend())
+        h.update(payload)
+        try:
+            h.verify(mac_tag)
+        except:
+            raise ValueError("File integrity check failed - data may be corrupted or tampered")
+        
+        # Skip header
+        header = payload[:32]  # "AESGCM_CHUNKED" + file_id
+        chunk_data = payload[32:]
+        
+        result = bytearray()
+        offset = 0
+        total_size = len(chunk_data)
+        
+        while offset < total_size:
+            chunk_index = int.from_bytes(chunk_data[offset:offset+8], 'big')
+            offset += 8
+            
+            nonce = chunk_data[offset:offset+12]
+            offset += 12
+            
+            # Determine remaining data size
+            remaining = total_size - offset
+            
+            # Derive chunk key
+            chunk_info = chunk_index.to_bytes(8, 'big')
+            chunk_kdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=mac_key, info=chunk_info, backend=default_backend())
+            chunk_key = chunk_kdf.derive(enc_key)
+            
+            # Decrypt chunk
+            aesgcm = AESGCM(chunk_key)
+            try:
+                ct = chunk_data[offset:total_size]
+                plaintext = aesgcm.decrypt(nonce, ct, chunk_info)
+                result.extend(plaintext)
+                break  # Last chunk
+            except:
+                offset += 12
+                aesgcm = AESGCM(chunk_key)
+                ct = chunk_data[offset:offset+65536+16]  # Approximate chunk
+                plaintext = aesgcm.decrypt(nonce, ct, chunk_info)
+                result.extend(plaintext)
+                offset += len(ct)
+                break
+        
+        return bytes(result)
 
 
 class RSACrypto:
     @staticmethod
-    def generate_rsa_keypair(key_size=2048):
-        private_key = rsa.generate_private_key(65537, key_size, default_backend())
-        public_key = private_key.public_key()
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        return private_pem, public_pem, private_key, public_key
+    def generate_rsa(key_size=2048):
+        sk = rsa.generate_private_key(65537, key_size, default_backend())
+        pk = sk.public_key()
+        return (sk.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()),
+                pk.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo), sk, pk)
     
     @staticmethod
-    def generate_ec_keypair(curve='secp256r1'):
+    def generate_ec(curve='secp256r1'):
         curves = {'secp256r1': ec.SECP256R1(), 'secp384r1': ec.SECP384R1(), 'secp521r1': ec.SECP521R1()}
-        selected_curve = curves.get(curve, ec.SECP256R1())
-        private_key = ec.generate_private_key(selected_curve, default_backend())
-        public_key = private_key.public_key()
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        return private_pem, public_pem, private_key, public_key
+        sk = ec.generate_private_key(curves.get(curve, ec.SECP256R1()), default_backend())
+        pk = sk.public_key()
+        return (sk.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()),
+                pk.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo), sk, pk)
     
     @staticmethod
-    def generate_ed25519_keypair():
-        private_key = ed25519.Ed25519PrivateKey.generate()
-        public_key = private_key.public_key()
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        return private_pem, public_pem, private_key, public_key
+    def generate_ed25519():
+        sk = Ed25519PrivateKey.generate()
+        pk = sk.public_key()
+        return (sk.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()),
+                pk.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo), sk, pk)
     
     @staticmethod
-    def load_private_key(pem_data):
-        private_key = serialization.load_pem_private_key(pem_data, password=None, backend=default_backend())
-        public_key = private_key.public_key()
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        return private_key, public_key, public_pem
+    def load_private(pem_data):
+        sk = serialization.load_pem_private_key(pem_data, password=None, backend=default_backend())
+        pk = sk.public_key()
+        return sk, pk, pk.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
     
     @staticmethod
-    def encrypt_text(text, public_key, use_alien: bool = True):
+    def _ed_to_x25519_pub(ed_pk):
+        raw = ed_pk.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+        return X25519PublicKey.from_public_bytes(raw)
+    
+    @staticmethod
+    def _ed_to_x25519_priv(ed_sk):
+        raw = ed_sk.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+        return X25519PrivateKey.from_private_bytes(raw)
+    
+    @classmethod
+    def encrypt_text(cls, text, public_key, use_alien: bool = True, one_time: bool = False):
         if isinstance(public_key, bytes):
             public_key = serialization.load_pem_public_key(public_key, backend=default_backend())
         aes_key = secrets.token_bytes(32)
-        aesgcm = AESGCM(aes_key)
-        nonce = secrets.token_bytes(12)
-        ct = aesgcm.encrypt(nonce, text.encode(), None)
-        encrypted_key = public_key.encrypt(
-            aes_key,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
-        combined = encrypted_key + nonce + ct
-        b64 = base64.b64encode(combined).decode()
-        if use_alien:
-            hex_str = b64.encode().hex()
-            return VexarScript.encode(hex_str)
-        return b64
-    
-    @staticmethod
-    def decrypt_text(text, private_key, use_alien: bool = True):
-        if use_alien:
-            hex_str = VexarScript.decode(text)
-            if not hex_str: return None
-            try:
-                b64 = bytes.fromhex(hex_str).decode()
-            except:
-                return None
+        ct = AESCrypto.encrypt_text(text, aes_key, use_alien=False, one_time=one_time).encode()
+        if hasattr(public_key, 'curve'):
+            eph_sk = ec.generate_private_key(public_key.curve, default_backend())
+            shared = eph_sk.exchange(ec.ECDH(), public_key)
+            derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'enc', backend=default_backend()).derive(shared)
+            enc_key = bytes(a ^ b for a, b in zip(aes_key, derived))
+            eph_pk = eph_sk.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+            combined = len(eph_pk).to_bytes(4, 'big') + eph_pk + enc_key + ct
+        elif hasattr(public_key, 'encrypt'):
+            enc_key = public_key.encrypt(aes_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+            combined = len(enc_key).to_bytes(4, 'big') + enc_key + ct
         else:
-            b64 = text
+            eph_sk = X25519PrivateKey.generate()
+            x25519_pk = cls._ed_to_x25519_pub(public_key)
+            shared = eph_sk.exchange(x25519_pk)
+            derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'enc', backend=default_backend()).derive(shared)
+            enc_key = bytes(a ^ b for a, b in zip(aes_key, derived))
+            eph_pk_bytes = eph_sk.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+            combined = len(eph_pk_bytes).to_bytes(4, 'big') + eph_pk_bytes + enc_key + ct
+        b64 = base64.b64encode(combined).decode()
+        return VexarScript.encode(b64.encode().hex()) if use_alien else b64
+    
+    @classmethod
+    def decrypt_text(cls, text, private_key, use_alien: bool = True):
         try:
+            if use_alien:
+                h = VexarScript.decode(text)
+                if not h: return None
+                b64 = bytes.fromhex(h).decode()
+            else:
+                b64 = text
             if isinstance(private_key, bytes):
                 private_key = serialization.load_pem_private_key(private_key, password=None, backend=default_backend())
             combined = base64.b64decode(b64)
-            key_size = private_key.key_size
-            encrypted_key_len = key_size // 8
-            encrypted_key = combined[:encrypted_key_len]
-            nonce = combined[encrypted_key_len:encrypted_key_len+12]
-            ct = combined[encrypted_key_len+12:]
-            aes_key = private_key.decrypt(
-                encrypted_key,
-                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-            )
-            aesgcm = AESGCM(aes_key)
-            return aesgcm.decrypt(nonce, ct, None).decode()
+            prefix_len = int.from_bytes(combined[:4], 'big')
+            if hasattr(private_key, 'curve'):
+                eph_pk = serialization.load_pem_public_key(combined[4:4+prefix_len], backend=default_backend())
+                shared = private_key.exchange(ec.ECDH(), eph_pk)
+                derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'enc', backend=default_backend()).derive(shared)
+                enc_key = combined[4+prefix_len:4+prefix_len+32]
+                ct = combined[4+prefix_len+32:]
+                aes_key = bytes(a ^ b for a, b in zip(enc_key, derived))
+            elif hasattr(private_key, 'decrypt'):
+                enc_key = combined[4:4+prefix_len]
+                ct = combined[4+prefix_len:]
+                aes_key = private_key.decrypt(enc_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+            else:
+                eph_pk_bytes = combined[4:4+prefix_len]
+                eph_pk = X25519PublicKey.from_public_bytes(eph_pk_bytes)
+                x25519_sk = cls._ed_to_x25519_priv(private_key)
+                shared = x25519_sk.exchange(eph_pk)
+                derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'enc', backend=default_backend()).derive(shared)
+                enc_key = combined[4+prefix_len:4+prefix_len+32]
+                ct = combined[4+prefix_len+32:]
+                aes_key = bytes(a ^ b for a, b in zip(enc_key, derived))
+            return AESCrypto.decrypt_text(ct.decode(), aes_key, use_alien=False)
         except:
             return None
     
-    @staticmethod
-    def encrypt_file(filepath, public_key):
+    @classmethod
+    def encrypt_file(cls, filepath, public_key):
         if isinstance(public_key, bytes):
             public_key = serialization.load_pem_public_key(public_key, backend=default_backend())
-        with open(filepath, 'rb') as f:
-            data = f.read()
+        with open(filepath, 'rb') as f: data = f.read()
         aes_key = secrets.token_bytes(32)
-        aesgcm = AESGCM(aes_key)
-        nonce = secrets.token_bytes(12)
-        ct = aesgcm.encrypt(nonce, data, None)
-        encrypted_key = public_key.encrypt(
-            aes_key,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
-        return encrypted_key + nonce + ct
+        ct = AESCrypto.encrypt_file(filepath, aes_key)
+        enc_key = public_key.encrypt(aes_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        return len(enc_key).to_bytes(4, 'big') + enc_key + ct
     
-    @staticmethod
-    def decrypt_file(encrypted_data, private_key):
+    @classmethod
+    def decrypt_file(cls, data, private_key):
         if isinstance(private_key, bytes):
             private_key = serialization.load_pem_private_key(private_key, password=None, backend=default_backend())
-        key_size = private_key.key_size
-        encrypted_key_len = key_size // 8
-        encrypted_key = encrypted_data[:encrypted_key_len]
-        nonce = encrypted_data[encrypted_key_len:encrypted_key_len+12]
-        ct = encrypted_data[encrypted_key_len+12:]
-        aes_key = private_key.decrypt(
-            encrypted_key,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-        )
-        aesgcm = AESGCM(aes_key)
-        return aesgcm.decrypt(nonce, ct, None)
+        prefix_len = int.from_bytes(data[:4], 'big')
+        enc_key = data[4:4+prefix_len]
+        ct = data[4+prefix_len:]
+        aes_key = private_key.decrypt(enc_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        return AESCrypto.decrypt_file(ct, aes_key)
 
 
-class WorkerSignals(QObject):
+class WorkerThread(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
-
-class CryptoWorker(QRunnable):
-    def __init__(self, func, *args, **kwargs):
+    progress = pyqtSignal(int)
+    
+    def __init__(self, func, *args):
         super().__init__()
         self.func = func
         self.args = args
-        self.kwargs = kwargs
-        self.signals = WorkerSignals()
     
     def run(self):
         try:
-            result = self.func(*self.args, **self.kwargs)
-            self.signals.finished.emit(result)
+            result = self.func(*self.args)
+            self.finished.emit(result)
         except Exception as e:
-            self.signals.error.emit(str(e))
+            self.error.emit(str(e))
 
 
 class AlienEncryptionApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Alien Encryption")
+        self.setWindowIcon(QIcon("icon.png"))
         self.setMinimumSize(950, 720)
-        self.resize(1000, 750)
         
         self.aes_key = None
         self.aes_salt = None
@@ -315,11 +397,9 @@ class AlienEncryptionApp(QMainWindow):
         self.rsa_public_pem = None
         self.current_rsa_type = 'rsa'
         self.alien_script_enabled = True
-        
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(4)
-        
-        self.aes_password_visible = False
+        self.dark_mode = True
+        self.pw_visible = False
+        self.one_time_enabled = False
         
         self.setup_ui()
         self.apply_theme()
@@ -332,6 +412,7 @@ class AlienEncryptionApp(QMainWindow):
         main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(12)
         
+        # Header
         header = QFrame()
         header.setObjectName("header")
         header_layout = QVBoxLayout(header)
@@ -343,74 +424,66 @@ class AlienEncryptionApp(QMainWindow):
         title_row.addWidget(title)
         title_row.addStretch()
         
-        self.alien_toggle_btn = QPushButton("👽 Alien: ON")
-        self.alien_toggle_btn.setObjectName("primaryBtn")
-        self.alien_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.alien_toggle_btn.clicked.connect(self.toggle_alien_script)
-        self.alien_toggle_btn.setFixedWidth(130)
-        title_row.addWidget(self.alien_toggle_btn)
+        self.alien_btn = QPushButton("👽 Alien: ON")
+        self.alien_btn.setObjectName("primaryBtn")
+        self.alien_btn.clicked.connect(self.toggle_alien)
+        self.alien_btn.setFixedWidth(130)
+        self.alien_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        title_row.addWidget(self.alien_btn)
+        
+        self.theme_btn = QPushButton("☀️ Light")
+        self.theme_btn.setObjectName("secondaryBtn")
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        self.theme_btn.setFixedWidth(100)
+        self.theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        title_row.addWidget(self.theme_btn)
         
         header_layout.addLayout(title_row)
-        
-        subtitle = QLabel("AES-256-GCM | RSA | EC | Ed25519")
-        subtitle.setObjectName("subtitle")
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(QLabel("AES-256-GCM | RSA | EC | Ed25519", objectName="subtitle"))
         main_layout.addWidget(header)
         
+        # Tabs
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
         main_layout.addWidget(self.tabs)
         
         self.aes_tab = self.create_aes_tab()
         self.rsa_tab = self.create_rsa_tab()
-        
         self.tabs.addTab(self.aes_tab, "  🔐 AES-256  ")
         self.tabs.addTab(self.rsa_tab, "  🔑 Asymmetric  ")
         
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setObjectName("progressBar")
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setMaximum(100)
-        main_layout.addWidget(self.progress_bar)
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.setObjectName("progressBar")
+        self.progress.setVisible(False)
+        self.progress.setMinimum(0)
+        self.progress.setMaximum(100)
+        main_layout.addWidget(self.progress)
         
-        self.status_label = QLabel("Ready")
-        self.status_label.setObjectName("status")
-        main_layout.addWidget(self.status_label)
+        # Status
+        self.status = QLabel("Ready")
+        self.status.setObjectName("status")
+        main_layout.addWidget(self.status)
     
-    def toggle_alien_script(self):
-        self.alien_script_enabled = not self.alien_script_enabled
-        if self.alien_script_enabled:
-            self.alien_toggle_btn.setText("👽 Alien: ON")
-            self.alien_toggle_btn.setStyleSheet("")
-            self.alien_toggle_btn.setObjectName("primaryBtn")
-            self.set_status("👽 Alien script enabled", "#00d4aa")
-        else:
-            self.alien_toggle_btn.setText("👽 Alien: OFF")
-            self.alien_toggle_btn.setObjectName("alienOffBtn")
-            self.set_status("👽 Alien script disabled - output will be plain Base64", "#888")
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.theme_btn.setText("🌙 Dark" if not self.dark_mode else "☀️ Light")
         self.apply_theme()
+    
+    def toggle_alien(self):
+        self.alien_script_enabled = not self.alien_script_enabled
+        self.alien_btn.setText(f"👽 Alien: {'ON' if self.alien_script_enabled else 'OFF'}")
+        self.alien_btn.setObjectName("primaryBtn" if self.alien_script_enabled else "secondaryBtn")
+        self.apply_theme()
+        self.set_status(f"Alien script {'enabled' if self.alien_script_enabled else 'disabled'}", "#0a0" if self.alien_script_enabled else "#888")
     
     def create_card(self):
         card = QFrame()
         card.setObjectName("card")
-        card.setFrameStyle(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(8)
         return card, layout
-    
-    def create_button(self, text, callback, primary=False, small=False):
-        btn = QPushButton(text)
-        if callback:
-            btn.clicked.connect(callback)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        if primary:
-            btn.setObjectName("primaryBtn")
-        elif small:
-            btn.setObjectName("smallBtn")
-        else:
-            btn.setObjectName("secondaryBtn")
-        return btn
     
     def create_aes_tab(self):
         tab = QWidget()
@@ -418,94 +491,48 @@ class AlienEncryptionApp(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(10)
         
-        key_card, key_layout = self.create_card()
-        key_label = QLabel("🔑 Encryption Key")
-        key_label.setObjectName("cardTitle")
-        key_layout.addWidget(key_label)
-        
-        key_input_layout = QHBoxLayout()
-        key_input_layout.setSpacing(8)
-        
+        # Key card
+        kc, kl = self.create_card()
+        kl.addWidget(QLabel("🔑 Encryption Key", objectName="cardTitle"))
+        kr = QHBoxLayout()
         self.aes_key_input = QLineEdit()
-        self.aes_key_input.setPlaceholderText("Enter password or hex key...")
         self.aes_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        key_input_layout.addWidget(self.aes_key_input)
+        self.aes_key_input.setPlaceholderText("Password or hex key...")
+        kr.addWidget(self.aes_key_input)
         
-        self.aes_eye_btn = QPushButton("👁")
-        self.aes_eye_btn.setObjectName("iconBtn")
-        self.aes_eye_btn.setToolTip("Show/Hide password")
-        self.aes_eye_btn.clicked.connect(self.toggle_aes_password_visibility)
-        self.aes_eye_btn.setFixedWidth(40)
-        key_input_layout.addWidget(self.aes_eye_btn)
+        self.eye_btn = QPushButton("👁"); self.eye_btn.setObjectName("smallBtn"); self.eye_btn.clicked.connect(self.toggle_pw); self.eye_btn.setFixedWidth(40); self.eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        kr.addWidget(self.eye_btn)
+        for t, f in [("📥", self.paste_aes), ("🎲", self.gen_aes), ("📋", lambda: self.cp(self.aes_key_input.text()))]:
+            b = QPushButton(t); b.setObjectName("secondaryBtn"); b.clicked.connect(f); b.setCursor(Qt.CursorShape.PointingHandCursor); kr.addWidget(b)
+        kl.addLayout(kr)
         
-        paste_btn = QPushButton("📥 Paste")
-        paste_btn.setObjectName("secondaryBtn")
-        paste_btn.clicked.connect(self.paste_aes_key)
-        key_input_layout.addWidget(paste_btn)
+        # One-time checkbox
+        self.one_time_cb = QCheckBox("🔒 One-time decryption (message can only be decrypted once)")
+        self.one_time_cb.setObjectName("cardTitle")
+        self.one_time_cb.toggled.connect(self.on_one_time_toggle)
+        kl.addWidget(self.one_time_cb)
         
-        gen_btn = self.create_button("🎲 Generate", self.gen_aes_key)
-        key_input_layout.addWidget(gen_btn)
+        layout.addWidget(kc)
         
-        copy_btn = self.create_button("📋 Copy", lambda: self.copy_to_clipboard(self.aes_key_input.text()))
-        key_input_layout.addWidget(copy_btn)
+        # Text areas
+        tl = QHBoxLayout()
+        for n, ti, ro in [("ai", "📝 Input", False), ("ao", "🔮 Output", True)]:
+            c, cl = self.create_card()
+            h = QHBoxLayout()
+            h.addWidget(QLabel(ti, objectName="cardTitle" if not ro else "cardTitlePurple"))
+            h.addStretch()
+            if ro:
+                cb = QPushButton("📋 Copy"); cb.setObjectName("smallBtn"); cb.clicked.connect(self.copy_aes_out); cb.setCursor(Qt.CursorShape.PointingHandCursor); h.addWidget(cb)
+            cl.addLayout(h)
+            te = QTextEdit(); te.setPlaceholderText("Enter text..." if not ro else "Result..."); te.setReadOnly(ro); cl.addWidget(te)
+            setattr(self, n, te); tl.addWidget(c)
+        layout.addLayout(tl, 1)
         
-        key_layout.addLayout(key_input_layout)
-        
-        self.pass_strength_label = QLabel("")
-        self.pass_strength_label.setObjectName("strengthLabel")
-        key_layout.addWidget(self.pass_strength_label)
-        self.aes_key_input.textChanged.connect(self.check_password_strength)
-        
-        layout.addWidget(key_card)
-        
-        text_layout = QHBoxLayout()
-        text_layout.setSpacing(10)
-        
-        input_card, input_layout = self.create_card()
-        input_label = QLabel("📝 Input")
-        input_label.setObjectName("cardTitle")
-        input_layout.addWidget(input_label)
-        
-        self.aes_input = QTextEdit()
-        self.aes_input.setPlaceholderText("Enter text to encrypt/decrypt...")
-        input_layout.addWidget(self.aes_input)
-        text_layout.addWidget(input_card)
-        
-        output_card, output_layout = self.create_card()
-        output_header = QHBoxLayout()
-        output_label = QLabel("🔮 Output")
-        output_label.setObjectName("cardTitlePurple")
-        output_header.addWidget(output_label)
-        output_header.addStretch()
-        copy_out_btn = self.create_button("📋 Copy", self.copy_aes_output, small=True)
-        output_header.addWidget(copy_out_btn)
-        output_layout.addLayout(output_header)
-        
-        self.aes_output = QTextEdit()
-        self.aes_output.setPlaceholderText("Encrypted/Decrypted result...")
-        self.aes_output.setReadOnly(True)
-        output_layout.addWidget(self.aes_output)
-        text_layout.addWidget(output_card)
-        
-        layout.addLayout(text_layout, 1)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(8)
-        
-        encrypt_btn = self.create_button("🔒 Encrypt", self.aes_encrypt_text, primary=True)
-        decrypt_btn = self.create_button("🔓 Decrypt", self.aes_decrypt_text)
-        swap_btn = self.create_button("⇄ Swap", self.swap_aes_text)
-        enc_file_btn = self.create_button("📁 Encrypt File", self.aes_encrypt_file)
-        dec_file_btn = self.create_button("📁 Decrypt File", self.aes_decrypt_file)
-        
-        btn_layout.addWidget(encrypt_btn)
-        btn_layout.addWidget(decrypt_btn)
-        btn_layout.addWidget(swap_btn)
-        btn_layout.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Policy.Expanding))
-        btn_layout.addWidget(enc_file_btn)
-        btn_layout.addWidget(dec_file_btn)
-        
-        layout.addLayout(btn_layout)
+        # Buttons
+        bl = QHBoxLayout()
+        for t, f, p in [("🔒 Encrypt", self.aes_enc, True), ("🔓 Decrypt", self.aes_dec, False), ("⇄ Swap", self.aes_swap, False), ("📁 Encrypt File", self.aes_enc_file, False), ("📁 Decrypt File", self.aes_dec_file, False)]:
+            b = QPushButton(t); b.setObjectName("primaryBtn" if p else "secondaryBtn"); b.clicked.connect(f); b.setCursor(Qt.CursorShape.PointingHandCursor); bl.addWidget(b)
+        layout.addLayout(bl)
         return tab
     
     def create_rsa_tab(self):
@@ -514,552 +541,299 @@ class AlienEncryptionApp(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(10)
         
-        config_card, config_layout = self.create_card()
-        key_type_layout = QHBoxLayout()
-        key_type_layout.setSpacing(15)
+        # Config
+        cc, cl = self.create_card()
+        ktr = QHBoxLayout(); ktr.addWidget(QLabel("🔧 Key Type:"))
+        self.kg = QButtonGroup()
+        for n, c in [("RSA", True), ("EC", False), ("Ed25519", False)]:
+            r = QRadioButton(n); r.setChecked(c); r.toggled.connect(self.on_kt); self.kg.addButton(r); ktr.addWidget(r)
+        ktr.addStretch(); cl.addLayout(ktr)
+        pr = QHBoxLayout()
+        self.kpl = QLabel("📏 Key Size:"); pr.addWidget(self.kpl)
+        self.kpc = QComboBox(); self.kpc.addItems(["2048","3072","4096","8192"]); pr.addWidget(self.kpc)
+        for t, f, p in [("🎲 Generate", self.gen_rsa, True), ("📥 Import", self.imp_rsa, False), ("💾 Save Keys", self.save_rsa, False)]:
+            b = QPushButton(t); b.setObjectName("primaryBtn" if p else "secondaryBtn"); b.clicked.connect(f); b.setCursor(Qt.CursorShape.PointingHandCursor); pr.addWidget(b)
+        pr.addStretch(); cl.addLayout(pr); layout.addWidget(cc)
         
-        key_type_label = QLabel("🔧 Key Type:")
-        key_type_label.setObjectName("cardTitle")
-        key_type_layout.addWidget(key_type_label)
+        # Keys
+        kc, kl = self.create_card()
+        for lb, co, fn in [("🔓 Public Key", "cardTitleGreen", "rp"), ("🔒 Private Key", "cardTitleRed", "rk")]:
+            kl.addWidget(QLabel(lb, objectName=co))
+            row = QHBoxLayout(); le = QLineEdit(); le.setReadOnly(True); setattr(self, fn, le); row.addWidget(le)
+            for ic, cbf in [("📋", lambda f=le: self.cp(f.text())), ("📥", lambda f=le: self.pf(f))]:
+                b = QPushButton(ic); b.setObjectName("smallBtn"); b.clicked.connect(cbf); b.setFixedWidth(45); b.setCursor(Qt.CursorShape.PointingHandCursor); row.addWidget(b)
+            kl.addLayout(row)
+        layout.addWidget(kc)
         
-        self.key_type_group = QButtonGroup()
+        # Text areas
+        tl = QHBoxLayout()
+        for n, ti, ro in [("ri", "📝 Input", False), ("ro", "🔮 Output", True)]:
+            c, cl = self.create_card()
+            h = QHBoxLayout()
+            h.addWidget(QLabel(ti, objectName="cardTitle" if not ro else "cardTitlePurple"))
+            h.addStretch()
+            if ro:
+                cb = QPushButton("📋 Copy"); cb.setObjectName("smallBtn"); cb.clicked.connect(self.copy_rsa_out); cb.setCursor(Qt.CursorShape.PointingHandCursor); h.addWidget(cb)
+            cl.addLayout(h)
+            te = QTextEdit(); te.setPlaceholderText("Enter text..." if not ro else "Result..."); te.setReadOnly(ro); cl.addWidget(te)
+            setattr(self, n, te); tl.addWidget(c)
+        layout.addLayout(tl, 1)
         
-        self.rsa_radio = QRadioButton("RSA")
-        self.rsa_radio.setChecked(True)
-        self.rsa_radio.toggled.connect(self.on_key_type_changed)
-        self.key_type_group.addButton(self.rsa_radio)
-        key_type_layout.addWidget(self.rsa_radio)
-        
-        self.ec_radio = QRadioButton("EC")
-        self.ec_radio.toggled.connect(self.on_key_type_changed)
-        self.key_type_group.addButton(self.ec_radio)
-        key_type_layout.addWidget(self.ec_radio)
-        
-        self.ed25519_radio = QRadioButton("Ed25519")
-        self.ed25519_radio.toggled.connect(self.on_key_type_changed)
-        self.key_type_group.addButton(self.ed25519_radio)
-        key_type_layout.addWidget(self.ed25519_radio)
-        
-        key_type_layout.addStretch()
-        config_layout.addLayout(key_type_layout)
-        
-        key_params_layout = QHBoxLayout()
-        key_params_layout.setSpacing(12)
-        
-        self.key_param_label = QLabel("📏 Key Size:")
-        self.key_param_label.setObjectName("cardTitle")
-        key_params_layout.addWidget(self.key_param_label)
-        
-        self.key_param_combo = QComboBox()
-        self.key_param_combo.addItems(["2048", "3072", "4096", "8192"])
-        key_params_layout.addWidget(self.key_param_combo)
-        
-        gen_btn = self.create_button("🎲 Generate Keys", self.gen_rsa_keys, primary=True)
-        key_params_layout.addWidget(gen_btn)
-        
-        import_btn = self.create_button("📥 Import Key", self.import_rsa_private)
-        key_params_layout.addWidget(import_btn)
-        
-        save_keys_btn = self.create_button("💾 Save Keys", self.save_rsa_keys)
-        key_params_layout.addWidget(save_keys_btn)
-        
-        key_params_layout.addStretch()
-        config_layout.addLayout(key_params_layout)
-        layout.addWidget(config_card)
-        
-        keys_card, keys_layout = self.create_card()
-        
-        pub_label = QLabel("🔓 Public Key")
-        pub_label.setObjectName("cardTitleGreen")
-        keys_layout.addWidget(pub_label)
-        
-        pub_row = QHBoxLayout()
-        self.rsa_public_display = QLineEdit()
-        self.rsa_public_display.setReadOnly(True)
-        self.rsa_public_display.setPlaceholderText("Public key will appear here...")
-        pub_row.addWidget(self.rsa_public_display)
-        
-        copy_pub_btn = QPushButton("📋")
-        copy_pub_btn.setObjectName("smallBtn")
-        copy_pub_btn.clicked.connect(lambda: self.copy_to_clipboard(self.rsa_public_display.text()))
-        copy_pub_btn.setFixedWidth(45)
-        pub_row.addWidget(copy_pub_btn)
-        
-        paste_pub_btn = QPushButton("📥")
-        paste_pub_btn.setObjectName("smallBtn")
-        paste_pub_btn.clicked.connect(lambda: self.paste_key_to_field(self.rsa_public_display))
-        paste_pub_btn.setFixedWidth(45)
-        pub_row.addWidget(paste_pub_btn)
-        
-        keys_layout.addLayout(pub_row)
-        
-        priv_label = QLabel("🔒 Private Key")
-        priv_label.setObjectName("cardTitleRed")
-        keys_layout.addWidget(priv_label)
-        
-        priv_row = QHBoxLayout()
-        self.rsa_private_display = QLineEdit()
-        self.rsa_private_display.setReadOnly(True)
-        self.rsa_private_display.setPlaceholderText("Private key will appear here...")
-        priv_row.addWidget(self.rsa_private_display)
-        
-        copy_priv_btn = QPushButton("📋")
-        copy_priv_btn.setObjectName("smallBtn")
-        copy_priv_btn.clicked.connect(lambda: self.copy_to_clipboard(self.rsa_private_display.text()))
-        copy_priv_btn.setFixedWidth(45)
-        priv_row.addWidget(copy_priv_btn)
-        
-        paste_priv_btn = QPushButton("📥")
-        paste_priv_btn.setObjectName("smallBtn")
-        paste_priv_btn.clicked.connect(lambda: self.paste_key_to_field(self.rsa_private_display))
-        paste_priv_btn.setFixedWidth(45)
-        priv_row.addWidget(paste_priv_btn)
-        
-        keys_layout.addLayout(priv_row)
-        layout.addWidget(keys_card)
-        
-        text_layout = QHBoxLayout()
-        text_layout.setSpacing(10)
-        
-        input_card, input_layout = self.create_card()
-        input_label = QLabel("📝 Input")
-        input_label.setObjectName("cardTitle")
-        input_layout.addWidget(input_label)
-        
-        self.rsa_input = QTextEdit()
-        self.rsa_input.setPlaceholderText("Enter text to encrypt/decrypt...")
-        input_layout.addWidget(self.rsa_input)
-        text_layout.addWidget(input_card)
-        
-        output_card, output_layout = self.create_card()
-        output_header = QHBoxLayout()
-        output_label = QLabel("🔮 Output")
-        output_label.setObjectName("cardTitlePurple")
-        output_header.addWidget(output_label)
-        output_header.addStretch()
-        copy_out_btn = self.create_button("📋 Copy", self.copy_rsa_output, small=True)
-        output_header.addWidget(copy_out_btn)
-        output_layout.addLayout(output_header)
-        
-        self.rsa_output = QTextEdit()
-        self.rsa_output.setPlaceholderText("Encrypted/Decrypted result...")
-        self.rsa_output.setReadOnly(True)
-        output_layout.addWidget(self.rsa_output)
-        text_layout.addWidget(output_card)
-        
-        layout.addLayout(text_layout, 1)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(8)
-        
-        encrypt_btn = self.create_button("🔒 Encrypt", self.rsa_encrypt_text, primary=True)
-        decrypt_btn = self.create_button("🔓 Decrypt", self.rsa_decrypt_text)
-        swap_btn = self.create_button("⇄ Swap", self.swap_rsa_text)
-        enc_file_btn = self.create_button("📁 Encrypt File", self.rsa_encrypt_file)
-        dec_file_btn = self.create_button("📁 Decrypt File", self.rsa_decrypt_file)
-        
-        btn_layout.addWidget(encrypt_btn)
-        btn_layout.addWidget(decrypt_btn)
-        btn_layout.addWidget(swap_btn)
-        btn_layout.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Policy.Expanding))
-        btn_layout.addWidget(enc_file_btn)
-        btn_layout.addWidget(dec_file_btn)
-        
-        layout.addLayout(btn_layout)
+        # Buttons
+        bl = QHBoxLayout()
+        for t, f, p in [("🔒 Encrypt", self.rsa_enc, True), ("🔓 Decrypt", self.rsa_dec, False), ("⇄ Swap", self.rsa_swap, False), ("📁 Encrypt File", self.rsa_enc_file, False), ("📁 Decrypt File", self.rsa_dec_file, False)]:
+            b = QPushButton(t); b.setObjectName("primaryBtn" if p else "secondaryBtn"); b.clicked.connect(f); b.setCursor(Qt.CursorShape.PointingHandCursor); bl.addWidget(b)
+        layout.addLayout(bl)
         return tab
     
-    def on_key_type_changed(self):
-        if self.rsa_radio.isChecked():
-            self.current_rsa_type = 'rsa'
-            self.key_param_label.setText("📏 Key Size:")
-            self.key_param_combo.clear()
-            self.key_param_combo.addItems(["2048", "3072", "4096", "8192"])
-        elif self.ec_radio.isChecked():
-            self.current_rsa_type = 'ec'
-            self.key_param_label.setText("📐 Curve:")
-            self.key_param_combo.clear()
-            self.key_param_combo.addItems(["secp256r1 (P-256)", "secp384r1 (P-384)", "secp521r1 (P-521)"])
-        elif self.ed25519_radio.isChecked():
-            self.current_rsa_type = 'ed25519'
-            self.key_param_label.setText("📐 Algorithm:")
-            self.key_param_combo.clear()
-            self.key_param_combo.addItems(["Ed25519"])
+    def on_kt(self):
+        for r in self.kg.buttons():
+            if r.isChecked(): t = r.text()
+        if t == "RSA": self.current_rsa_type = 'rsa'; self.kpl.setText("📏 Key Size:"); self.kpc.clear(); self.kpc.addItems(["2048","3072","4096","8192"])
+        elif t == "EC": self.current_rsa_type = 'ec'; self.kpl.setText("📐 Curve:"); self.kpc.clear(); self.kpc.addItems(["secp256r1 (P-256)","secp384r1 (P-384)","secp521r1 (P-521)"])
+        else: self.current_rsa_type = 'ed25519'; self.kpl.setText("📐 Algorithm:"); self.kpc.clear(); self.kpc.addItems(["Ed25519"])
+    
+    def on_one_time_toggle(self, checked):
+        self.one_time_enabled = checked
+        if checked:
+            self.set_status("⚠️ One-time decryption enabled - message can only be decrypted once", "#ffa500")
+        else:
+            self.set_status("✅ Normal encryption mode", "#0a0")
     
     def apply_theme(self):
-        alien_off_style = ""
-        if not self.alien_script_enabled:
-            alien_off_style = """
-            #alienOffBtn {
-                background-color: #252540;
-                color: #888;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 16px;
-                font-weight: bold;
-                font-size: 12px;
-            }
-            #alienOffBtn:hover {
-                background-color: #2d2d50;
-            }
-            """
-        
+        d = self.dark_mode
         style = f"""
-        QMainWindow {{ background-color: #0d0d1a; }}
-        QWidget {{ font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; color: #e8e8f0; }}
-        #header {{ background-color: #1a1a30; border: 1px solid #2a2a45; border-radius: 12px; }}
-        #title {{ font-size: 24px; font-weight: bold; color: #00d4aa; }}
-        #subtitle {{ font-size: 11px; color: #888; }}
+        * {{ font-family: 'Segoe UI', sans-serif; font-size: 13px; }}
+        QMainWindow {{ background-color: {'#0d0d1a' if d else '#f0f0f0'}; }}
+        QWidget {{ color: {'#e8e8f0' if d else '#222'}; }}
+        #header {{ background-color: {'#1a1a30' if d else '#ffffff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; border-radius: 12px; }}
+        #title {{ font-size: 24px; font-weight: bold; color: {'#00d4aa' if d else '#007755'}; background: transparent; }}
+        #subtitle {{ font-size: 11px; color: {'#888' if d else '#777'}; background: transparent; }}
         #mainTabs {{ background-color: transparent; }}
-        #mainTabs::pane {{ border: none; background-color: transparent; }}
-        #mainTabs::tab-bar {{ alignment: left; }}
-        QTabBar::tab {{ background-color: #1a1a30; color: #e8e8f0; padding: 10px 20px; margin-right: 4px; border-radius: 8px 8px 0 0; font-weight: bold; font-size: 13px; }}
-        QTabBar::tab:selected {{ background-color: #00d4aa; color: #0d0d1a; }}
-        QTabBar::tab:hover:!selected {{ background-color: #252540; }}
-        #card {{ background-color: #1a1a30; border: 1px solid #2a2a45; border-radius: 10px; }}
-        #cardTitle {{ font-size: 14px; font-weight: bold; color: #e8e8f0; }}
-        #cardTitlePurple {{ font-size: 14px; font-weight: bold; color: #c084fc; }}
-        #cardTitleGreen {{ font-size: 14px; font-weight: bold; color: #00d4aa; }}
-        #cardTitleRed {{ font-size: 14px; font-weight: bold; color: #ff6b6b; }}
-        #strengthLabel {{ font-size: 11px; padding: 2px 0; }}
-        QLineEdit {{ background-color: #12122a; border: 1px solid #2a2a45; border-radius: 6px; padding: 8px 12px; color: #e8e8f0; font-family: 'Consolas', monospace; font-size: 12px; }}
-        QLineEdit:focus {{ border-color: #00d4aa; }}
-        QTextEdit {{ background-color: #12122a; border: 1px solid #2a2a45; border-radius: 6px; padding: 10px; color: #e8e8f0; font-size: 13px; }}
-        QTextEdit:focus {{ border-color: #00d4aa; }}
-        QPushButton {{ background-color: #252540; color: #e8e8f0; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; font-size: 12px; }}
-        QPushButton:hover {{ background-color: #2d2d50; }}
-        QPushButton:pressed {{ background-color: #1a1a30; }}
-        #primaryBtn {{ background-color: #00d4aa; color: #0d0d1a; }}
-        #primaryBtn:hover {{ background-color: #00e6b8; }}
+        #mainTabs::pane {{ border: none; background: transparent; }}
+        QTabBar::tab {{ background-color: {'#1a1a30' if d else '#ffffff'}; color: {'#e0e0e0' if d else '#333'}; padding: 10px 20px; margin-right: 4px; border-radius: 8px 8px 0 0; font-weight: bold; border: 1px solid {'#2a2a45' if d else '#ccc'}; }}
+        QTabBar::tab:selected {{ background-color: {'#00d4aa' if d else '#007755'}; color: {'#0d0d1a' if d else '#fff'}; }}
+        QTabBar::tab:hover:!selected {{ background-color: {'#252540' if d else '#e8e8e8'}; }}
+        #card {{ background-color: {'#1a1a30' if d else '#ffffff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; border-radius: 10px; }}
+        #cardTitle {{ font-size: 14px; font-weight: bold; color: {'#e8e8f0' if d else '#222'}; background: transparent; }}
+        #cardTitlePurple {{ font-size: 14px; font-weight: bold; color: {'#c084fc' if d else '#5500aa'}; background: transparent; }}
+        #cardTitleGreen {{ font-size: 14px; font-weight: bold; color: {'#00d4aa' if d else '#007755'}; background: transparent; }}
+        #cardTitleRed {{ font-size: 14px; font-weight: bold; color: {'#ff6b6b' if d else '#aa0000'}; background: transparent; }}
+        QLineEdit {{ background-color: {'#12122a' if d else '#ffffff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; border-radius: 6px; padding: 8px 12px; color: {'#e8e8f0' if d else '#222'}; font-family: 'Consolas', monospace; font-size: 12px; }}
+        QLineEdit:focus {{ border-color: {'#00d4aa' if d else '#007755'}; }}
+        QTextEdit {{ background-color: {'#12122a' if d else '#ffffff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; border-radius: 6px; padding: 10px; color: {'#e8e8f0' if d else '#222'}; }}
+        QTextEdit:focus {{ border-color: {'#00d4aa' if d else '#007755'}; }}
+        QPushButton {{ background-color: {'#252540' if d else '#e0e0e0'}; color: {'#e8e8f0' if d else '#222'}; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; font-size: 12px; }}
+        QPushButton:hover {{ background-color: {'#2d2d50' if d else '#d0d0d0'}; }}
+        #primaryBtn {{ background-color: {'#00d4aa' if d else '#007755'}; color: {'#0d0d1a' if d else '#fff'}; }}
+        #primaryBtn:hover {{ background-color: {'#00e6b8' if d else '#005544'}; }}
+        #secondaryBtn {{ background-color: {'#252540' if d else '#e0e0e0'}; color: {'#e8e8f0' if d else '#222'}; }}
+        #secondaryBtn:hover {{ background-color: {'#2d2d50' if d else '#d0d0d0'}; }}
         #smallBtn {{ padding: 4px 10px; font-size: 11px; min-width: 40px; max-width: 50px; }}
-        #iconBtn {{ padding: 4px; font-size: 16px; background-color: #252540; min-width: 36px; max-width: 36px; }}
-        #iconBtn:hover {{ background-color: #2d2d50; }}
-        QRadioButton {{ color: #e8e8f0; spacing: 8px; font-size: 12px; }}
-        QRadioButton::indicator {{ width: 18px; height: 18px; border-radius: 9px; border: 2px solid #2a2a45; background-color: #12122a; }}
-        QRadioButton::indicator:checked {{ border-color: #00d4aa; background-color: #00d4aa; }}
-        QComboBox {{ background-color: #12122a; border: 1px solid #2a2a45; border-radius: 6px; padding: 8px 12px; color: #e8e8f0; font-size: 12px; min-width: 160px; }}
+        QCheckBox {{ color: {'#e8e8f0' if d else '#222'}; spacing: 8px; background: transparent; }}
+        QCheckBox::indicator {{ width: 20px; height: 20px; border-radius: 4px; border: 2px solid {'#2a2a45' if d else '#aaa'}; background-color: {'#12122a' if d else '#fff'}; }}
+        QCheckBox::indicator:checked {{ border-color: {'#00d4aa' if d else '#007755'}; background-color: {'#00d4aa' if d else '#007755'}; }}
+        QRadioButton {{ color: {'#e8e8f0' if d else '#222'}; spacing: 8px; background: transparent; }}
+        QRadioButton::indicator {{ width: 18px; height: 18px; border-radius: 9px; border: 2px solid {'#2a2a45' if d else '#aaa'}; background-color: {'#12122a' if d else '#fff'}; }}
+        QRadioButton::indicator:checked {{ border-color: {'#00d4aa' if d else '#007755'}; background-color: {'#00d4aa' if d else '#007755'}; }}
+        QComboBox {{ background-color: {'#12122a' if d else '#fff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; border-radius: 6px; padding: 8px 12px; color: {'#e8e8f0' if d else '#222'}; font-size: 12px; min-width: 160px; }}
         QComboBox::drop-down {{ border: none; }}
-        QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #e8e8f0; margin-right: 8px; }}
-        QComboBox QAbstractItemView {{ background-color: #1a1a30; border: 1px solid #2a2a45; color: #e8e8f0; selection-background-color: #00d4aa; selection-color: #0d0d1a; }}
-        #progressBar {{ background-color: #12122a; border: none; border-radius: 4px; height: 6px; }}
-        #progressBar::chunk {{ background-color: #00d4aa; border-radius: 4px; }}
-        #status {{ font-size: 11px; color: #888; padding: 4px 0; }}
-        {alien_off_style}
+        QComboBox::down-arrow {{ image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid {'#e8e8f0' if d else '#333'}; margin-right: 8px; }}
+        QComboBox QAbstractItemView {{ background-color: {'#1a1a30' if d else '#fff'}; border: 1px solid {'#2a2a45' if d else '#ccc'}; color: {'#e8e8f0' if d else '#222'}; selection-background-color: {'#00d4aa' if d else '#007755'}; selection-color: {'#0d0d1a' if d else '#fff'}; }}
+        #progressBar {{ background-color: {'#12122a' if d else '#e8e8e8'}; border: none; border-radius: 4px; height: 6px; }}
+        #progressBar::chunk {{ background-color: {'#00d4aa' if d else '#007755'}; border-radius: 4px; }}
+        #status {{ font-size: 11px; color: {'#888' if d else '#777'}; padding: 4px 0; background: transparent; }}
+        QLabel {{ background: transparent; }}
         """
         self.setStyleSheet(style)
     
-    def check_password_strength(self, text):
-        if not text:
-            self.pass_strength_label.setText("")
-            return
-        try:
-            key = bytes.fromhex(text)
-            if len(key) == 32:
-                self.pass_strength_label.setText("🔐 Strong hex key (256-bit)")
-                self.pass_strength_label.setStyleSheet("color: #00d4aa; font-size: 11px;")
-                return
-        except:
-            pass
-        score = 0
-        if len(text) >= 8: score += 1
-        if len(text) >= 12: score += 1
-        if len(text) >= 16: score += 1
-        if any(c.isupper() for c in text): score += 1
-        if any(c.islower() for c in text): score += 1
-        if any(c.isdigit() for c in text): score += 1
-        if any(not c.isalnum() for c in text): score += 1
-        if score <= 2: strength, color = "Weak", "#ff6b6b"
-        elif score <= 4: strength, color = "Medium", "#ffa500"
-        else: strength, color = "Strong", "#00d4aa"
-        self.pass_strength_label.setText(f"Password strength: {strength} (Will be strengthened with PBKDF2)")
-        self.pass_strength_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+    def run_thread(self, func, *args, on_finish=None, status=None, progress_cb=None):
+        if status: self.set_status(status, "#2196f3")
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.thread = WorkerThread(func, *args)
+        if on_finish: self.thread.finished.connect(on_finish)
+        self.thread.finished.connect(lambda _: self.progress.setVisible(False))
+        self.thread.error.connect(lambda e: (self.set_status(f"Error: {e}", "red"), self.progress.setVisible(False)))
+        if progress_cb: self.thread.progress.connect(progress_cb)
+        self.thread.start()
     
-    def show_progress(self):
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+    def toggle_pw(self):
+        self.pw_visible = not self.pw_visible
+        self.aes_key_input.setEchoMode(QLineEdit.EchoMode.Normal if self.pw_visible else QLineEdit.EchoMode.Password)
+        self.eye_btn.setText("🙈" if self.pw_visible else "👁")
     
-    def hide_progress(self):
-        self.progress_bar.setVisible(False)
+    def paste_aes(self):
+        t = QApplication.clipboard().text()
+        if t: self.aes_key_input.setText(t.strip())
     
-    def toggle_aes_password_visibility(self):
-        self.aes_password_visible = not self.aes_password_visible
-        if self.aes_password_visible:
-            self.aes_key_input.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.aes_eye_btn.setText("🙈")
-        else:
-            self.aes_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self.aes_eye_btn.setText("👁")
-    
-    def paste_aes_key(self):
-        clipboard = QApplication.clipboard().text()
-        if clipboard:
-            self.aes_key_input.setText(clipboard.strip())
-            self.set_status("📥 Key pasted from clipboard", "#2196f3")
-    
-    def gen_aes_key(self):
-        key = AESCrypto.generate_key()
-        self.aes_key_input.setText(key.hex())
-        self.aes_key = key
+    def gen_aes(self):
+        self.aes_key = AESCrypto.generate_key()
+        self.aes_key_input.setText(self.aes_key.hex())
         self.aes_salt = None
-        self.set_status("✅ Strong key generated", "#00d4aa")
     
-    def get_aes_key(self) -> Optional[bytes]:
+    def get_aes_key(self):
         k = self.aes_key_input.text().strip()
-        if not k:
-            QMessageBox.warning(self, "Error", "Please enter a password or generate a key")
-            return None
+        if not k: QMessageBox.warning(self, "Error", "Enter password or key"); return None
         try:
             key = bytes.fromhex(k)
-            if len(key) == 32:
-                self.aes_key = key
-                self.aes_salt = None
-                return key
-        except:
-            pass
-        if self.aes_salt:
-            key, _ = AESCrypto.derive_key(k, self.aes_salt)
-        else:
-            key, self.aes_salt = AESCrypto.derive_key(k)
-        self.aes_key = key
-        return key
+            if len(key) == 32: self.aes_key = key; return key
+        except: pass
+        if self.aes_salt: self.aes_key, _ = AESCrypto.derive_key(k, self.aes_salt)
+        else: self.aes_key, self.aes_salt = AESCrypto.derive_key(k)
+        return self.aes_key
     
-    def aes_encrypt_text(self):
-        text = self.aes_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Warning", "Enter text to encrypt")
-            return
-        key = self.get_aes_key()
-        if not key:
-            return
-        self.run_async(AESCrypto.encrypt_text, (text, key, self.alien_script_enabled), self.show_aes_output, "🔒 Encrypting...")
+    def aes_enc(self):
+        t = self.ai.toPlainText().strip()
+        if not t: return QMessageBox.warning(self, "Warning", "Enter text")
+        k = self.get_aes_key()
+        if not k: return
+        self.run_thread(AESCrypto.encrypt_text, t, k, self.alien_script_enabled, self.one_time_enabled, on_finish=lambda r: self.ao.setPlainText(r), status="Encrypting...")
     
-    def aes_decrypt_text(self):
-        text = self.aes_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Warning", "Paste encrypted text in Input field")
-            return
-        key = self.get_aes_key()
-        if not key:
-            return
-        def on_finish(result):
-            if result: self.show_aes_output(result)
-            else: self.set_status("❌ Invalid key or corrupted data", "#ff6b6b")
-        self.run_async(AESCrypto.decrypt_text, (text, key, self.alien_script_enabled), on_finish, "🔓 Decrypting...")
+    def aes_dec(self):
+        t = self.ai.toPlainText().strip()
+        if not t: return QMessageBox.warning(self, "Warning", "Paste encrypted text")
+        k = self.get_aes_key()
+        if not k: return
+        def cb(r):
+            if r: self.ao.setPlainText(r)
+            else: self.set_status("Invalid key or data", "red")
+        self.run_thread(AESCrypto.decrypt_text, t, k, self.alien_script_enabled, on_finish=cb, status="Decrypting...")
     
-    def show_aes_output(self, text):
-        self.aes_output.setPlainText(text)
-        self.set_status("✅ Done", "#00d4aa")
-        self.hide_progress()
+    def aes_swap(self):
+        i = self.ai.toPlainText(); o = self.ao.toPlainText()
+        self.ai.setPlainText(o); self.ao.setPlainText(i)
     
-    def swap_aes_text(self):
-        input_text = self.aes_input.toPlainText()
-        output_text = self.aes_output.toPlainText()
-        self.aes_input.setPlainText(output_text)
-        self.aes_output.setPlainText(input_text)
-        self.set_status("⇄ Swapped", "#2196f3")
+    def aes_enc_file(self):
+        k = self.get_aes_key()
+        if not k: return
+        fp, _ = QFileDialog.getOpenFileName(self, "Select file to encrypt")
+        if not fp: return
+        def update_progress(v): self.progress.setValue(v)
+        def task(): return AESCrypto.encrypt_file(fp, k, progress_callback=update_progress)
+        self.run_thread(task, on_finish=lambda d: self._save_file(d, fp, ".enc"), status="Encrypting file...", progress_cb=update_progress)
     
-    def aes_encrypt_file(self):
-        key = self.get_aes_key()
-        if not key: return
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select file to encrypt")
-        if not filepath: return
-        self.show_progress()
+    def aes_dec_file(self):
+        k = self.get_aes_key()
+        if not k: return
+        fp, _ = QFileDialog.getOpenFileName(self, "Select encrypted file")
+        if not fp: return
+        def update_progress(v): self.progress.setValue(v)
         def task():
-            encrypted = AESCrypto.encrypt_file(filepath, key)
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save encrypted file", os.path.basename(filepath) + ".enc")
-            if save_path:
-                with open(save_path, 'wb') as f: f.write(encrypted)
-                return os.path.basename(save_path)
-            return None
-        def on_finish(filename):
-            if filename: self.set_status(f"✅ Encrypted: {filename}", "#00d4aa")
-            self.hide_progress()
-        self.run_async(task, on_finish=on_finish, status_msg="📁 Encrypting file...")
+            with open(fp, 'rb') as f: data = f.read()
+            return AESCrypto.decrypt_file(data, k, progress_callback=update_progress)
+        self.run_thread(task, on_finish=lambda d: self._save_file(d, fp, ""), status="Decrypting file...", progress_cb=update_progress)
     
-    def aes_decrypt_file(self):
-        key = self.get_aes_key()
-        if not key: return
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select encrypted file")
-        if not filepath: return
-        self.show_progress()
-        def task():
-            with open(filepath, 'rb') as f: encrypted = f.read()
-            decrypted = AESCrypto.decrypt_file(encrypted, key)
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save decrypted file", os.path.basename(filepath).replace('.enc', ''))
-            if save_path:
-                with open(save_path, 'wb') as f: f.write(decrypted)
-                return os.path.basename(save_path)
-            return None
-        def on_finish(filename):
-            if filename: self.set_status(f"✅ Decrypted: {filename}", "#00d4aa")
-            self.hide_progress()
-        self.run_async(task, on_finish=on_finish, status_msg="📁 Decrypting file...")
+    def _save_file(self, data, original_path, ext):
+        base = os.path.basename(original_path).replace('.enc', '')
+        sp, _ = QFileDialog.getSaveFileName(self, "Save file", base + ext)
+        if sp:
+            with open(sp, 'wb') as f: f.write(data)
+            self.set_status(f"Saved: {os.path.basename(sp)}", "#0a0")
     
-    def copy_aes_output(self):
-        text = self.aes_output.toPlainText()
-        if text:
-            self.copy_to_clipboard(text)
-            self.set_status("📋 Copied to clipboard", "#2196f3")
+    def copy_aes_out(self):
+        t = self.ao.toPlainText()
+        if t: self.cp(t)
     
-    def gen_rsa_keys(self):
-        key_param = self.key_param_combo.currentText()
-        if self.current_rsa_type == 'rsa':
-            key_size = int(key_param.split()[0] if ' ' in key_param else key_param)
-            func, args, status = RSACrypto.generate_rsa_keypair, (key_size,), f"🎲 Generating RSA-{key_size}..."
-        elif self.current_rsa_type == 'ec':
-            curve_name = key_param.split()[0] if ' ' in key_param else 'secp256r1'
-            func, args, status = RSACrypto.generate_ec_keypair, (curve_name,), f"🎲 Generating EC {curve_name}..."
-        else:
-            func, args, status = RSACrypto.generate_ed25519_keypair, (), "🎲 Generating Ed25519..."
-        def on_finish(result):
-            priv_pem, pub_pem, private_key, public_key = result
-            self.rsa_private, self.rsa_public = private_key, public_key
-            self.rsa_private_pem, self.rsa_public_pem = priv_pem, pub_pem
-            self.rsa_private_display.setText(priv_pem.decode())
-            self.rsa_public_display.setText(pub_pem.decode())
-            self.set_status("✅ Keys generated", "#00d4aa")
-        self.run_async(func, args, on_finish, status)
+    def gen_rsa(self):
+        kp = self.kpc.currentText()
+        if self.current_rsa_type == 'rsa': f, a = RSACrypto.generate_rsa, (int(kp.split()[0]),)
+        elif self.current_rsa_type == 'ec': f, a = RSACrypto.generate_ec, (kp.split()[0],)
+        else: f, a = RSACrypto.generate_ed25519, ()
+        def cb(r):
+            self.rsa_private_pem, self.rsa_public_pem, self.rsa_private, self.rsa_public = r
+            self.rk.setText(r[0].decode()); self.rp.setText(r[1].decode())
+            self.set_status("Keys generated", "#0a0")
+        self.run_thread(f, *a, on_finish=cb, status="Generating keys...")
     
-    def import_rsa_private(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Import Private Key PEM", filter="PEM files (*.pem);;All files (*.*)")
-        if not filepath: return
+    def imp_rsa(self):
+        fp, _ = QFileDialog.getOpenFileName(self, "Import Key", filter="PEM files (*.pem);;All files (*.*)")
+        if not fp: return
         try:
-            with open(filepath, 'rb') as f: pem_data = f.read()
-            private_key, public_key, public_pem = RSACrypto.load_private_key(pem_data)
-            self.rsa_private, self.rsa_public = private_key, public_key
-            self.rsa_private_pem, self.rsa_public_pem = pem_data, public_pem
-            self.rsa_private_display.setText(pem_data.decode())
-            self.rsa_public_display.setText(public_pem.decode())
-            self.set_status("✅ Private key imported", "#00d4aa")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Invalid private key: {e}")
+            with open(fp, 'rb') as f: pem = f.read()
+            self.rsa_private, self.rsa_public, pp = RSACrypto.load_private(pem)
+            self.rsa_private_pem, self.rsa_public_pem = pem, pp
+            self.rk.setText(pem.decode()); self.rp.setText(pp.decode())
+            self.set_status("Key imported", "#0a0")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
     
-    def save_rsa_keys(self):
-        if not self.rsa_private_pem or not self.rsa_public_pem:
-            QMessageBox.warning(self, "Error", "Generate or import keys first")
-            return
-        directory = QFileDialog.getExistingDirectory(self, "Select folder to save keys")
-        if not directory: return
-        try:
-            with open(os.path.join(directory, "private_key.pem"), 'wb') as f: f.write(self.rsa_private_pem)
-            with open(os.path.join(directory, "public_key.pem"), 'wb') as f: f.write(self.rsa_public_pem)
-            self.set_status(f"✅ Keys saved to {directory}", "#00d4aa")
-            QMessageBox.information(self, "Keys Saved", f"Keys saved successfully!\n\n⚠️ Keep your private key secure!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save keys: {e}")
+    def save_rsa(self):
+        if not self.rsa_private_pem: return QMessageBox.warning(self, "Error", "Generate keys first")
+        d = QFileDialog.getExistingDirectory(self, "Select folder")
+        if not d: return
+        with open(os.path.join(d, "private_key.pem"), 'wb') as f: f.write(self.rsa_private_pem)
+        with open(os.path.join(d, "public_key.pem"), 'wb') as f: f.write(self.rsa_public_pem)
+        QMessageBox.information(self, "Saved", f"Keys saved to {d}")
     
-    def paste_key_to_field(self, field):
-        clipboard = QApplication.clipboard().text()
-        if clipboard:
-            field.setText(clipboard.strip())
-            self.set_status("📥 Key pasted", "#2196f3")
+    def pf(self, f):
+        t = QApplication.clipboard().text()
+        if t: f.setText(t.strip())
     
     def get_rsa_keys(self):
-        if not self.rsa_public_pem or not self.rsa_private_pem:
-            QMessageBox.warning(self, "Error", "Generate or import keys first")
-            return None, None
+        if not self.rsa_public_pem: QMessageBox.warning(self, "Error", "Generate or import keys"); return None, None
         return self.rsa_private, self.rsa_public
     
-    def rsa_encrypt_text(self):
-        text = self.rsa_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Warning", "Enter text to encrypt")
-            return
-        _, public_key = self.get_rsa_keys()
-        if not public_key: return
-        self.run_async(RSACrypto.encrypt_text, (text, public_key, self.alien_script_enabled), self.show_rsa_output, "🔒 Encrypting...")
+    def rsa_enc(self):
+        t = self.ri.toPlainText().strip()
+        if not t: return QMessageBox.warning(self, "Warning", "Enter text")
+        _, pk = self.get_rsa_keys()
+        if not pk: return
+        self.run_thread(RSACrypto.encrypt_text, t, pk, self.alien_script_enabled, self.one_time_enabled, on_finish=lambda r: self.ro.setPlainText(r), status="Encrypting...")
     
-    def rsa_decrypt_text(self):
-        text = self.rsa_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Warning", "Paste encrypted text in Input field")
-            return
-        private_key, _ = self.get_rsa_keys()
-        if not private_key: return
-        def on_finish(result):
-            if result: self.show_rsa_output(result)
-            else: self.set_status("❌ Invalid key or corrupted data", "#ff6b6b")
-        self.run_async(RSACrypto.decrypt_text, (text, private_key, self.alien_script_enabled), on_finish, "🔓 Decrypting...")
+    def rsa_dec(self):
+        t = self.ri.toPlainText().strip()
+        if not t: return QMessageBox.warning(self, "Warning", "Paste encrypted text")
+        sk, _ = self.get_rsa_keys()
+        if not sk: return
+        def cb(r):
+            if r: self.ro.setPlainText(r)
+            else: self.set_status("Invalid key or data", "red")
+        self.run_thread(RSACrypto.decrypt_text, t, sk, self.alien_script_enabled, on_finish=cb, status="Decrypting...")
     
-    def show_rsa_output(self, text):
-        self.rsa_output.setPlainText(text)
-        self.set_status("✅ Done", "#00d4aa")
-        self.hide_progress()
+    def rsa_swap(self):
+        i = self.ri.toPlainText(); o = self.ro.toPlainText()
+        self.ri.setPlainText(o); self.ro.setPlainText(i)
     
-    def swap_rsa_text(self):
-        input_text = self.rsa_input.toPlainText()
-        output_text = self.rsa_output.toPlainText()
-        self.rsa_input.setPlainText(output_text)
-        self.rsa_output.setPlainText(input_text)
-        self.set_status("⇄ Swapped", "#2196f3")
+    def rsa_enc_file(self):
+        _, pk = self.get_rsa_keys()
+        if not pk: return
+        fp, _ = QFileDialog.getOpenFileName(self, "Select file to encrypt")
+        if not fp: return
+        def task(): return RSACrypto.encrypt_file(fp, pk)
+        self.run_thread(task, on_finish=lambda d: self._save_file(d, fp, ".enc"), status="Encrypting file...")
     
-    def rsa_encrypt_file(self):
-        _, public_key = self.get_rsa_keys()
-        if not public_key: return
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select file to encrypt")
-        if not filepath: return
-        self.show_progress()
+    def rsa_dec_file(self):
+        sk, _ = self.get_rsa_keys()
+        if not sk: return
+        fp, _ = QFileDialog.getOpenFileName(self, "Select encrypted file")
+        if not fp: return
         def task():
-            encrypted = RSACrypto.encrypt_file(filepath, public_key)
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save encrypted file", os.path.basename(filepath) + ".enc")
-            if save_path:
-                with open(save_path, 'wb') as f: f.write(encrypted)
-                return os.path.basename(save_path)
-            return None
-        def on_finish(filename):
-            if filename: self.set_status(f"✅ Encrypted: {filename}", "#00d4aa")
-            self.hide_progress()
-        self.run_async(task, on_finish=on_finish, status_msg="📁 Encrypting file...")
+            with open(fp, 'rb') as f: return RSACrypto.decrypt_file(f.read(), sk)
+        self.run_thread(task, on_finish=lambda d: self._save_file(d, fp, ""), status="Decrypting file...")
     
-    def rsa_decrypt_file(self):
-        private_key, _ = self.get_rsa_keys()
-        if not private_key: return
-        filepath, _ = QFileDialog.getOpenFileName(self, "Select encrypted file")
-        if not filepath: return
-        self.show_progress()
-        def task():
-            with open(filepath, 'rb') as f: encrypted = f.read()
-            decrypted = RSACrypto.decrypt_file(encrypted, private_key)
-            save_path, _ = QFileDialog.getSaveFileName(self, "Save decrypted file", os.path.basename(filepath).replace('.enc', ''))
-            if save_path:
-                with open(save_path, 'wb') as f: f.write(decrypted)
-                return os.path.basename(save_path)
-            return None
-        def on_finish(filename):
-            if filename: self.set_status(f"✅ Decrypted: {filename}", "#00d4aa")
-            self.hide_progress()
-        self.run_async(task, on_finish=on_finish, status_msg="📁 Decrypting file...")
+    def copy_rsa_out(self):
+        t = self.ro.toPlainText()
+        if t: self.cp(t)
     
-    def copy_rsa_output(self):
-        text = self.rsa_output.toPlainText()
-        if text:
-            self.copy_to_clipboard(text)
-            self.set_status("📋 Copied to clipboard", "#2196f3")
-    
-    def run_async(self, func, args=None, on_finish=None, status_msg=None):
-        if status_msg: self.set_status(f"⏳ {status_msg}", "#2196f3")
-        worker = CryptoWorker(func, *(args or ()))
-        if on_finish: worker.signals.finished.connect(on_finish)
-        worker.signals.error.connect(lambda e: self.set_status(f"❌ {e}", "#ff6b6b"))
-        worker.signals.error.connect(lambda: self.hide_progress())
-        self.thread_pool.start(worker)
-    
-    def copy_to_clipboard(self, text):
+    def cp(self, text):
         if text: QApplication.clipboard().setText(text)
     
-    def set_status(self, message, color="#888"):
-        self.status_label.setText(message)
-        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+    def set_status(self, msg, color="#888"):
+        self.status.setText(msg)
+        self.status.setStyleSheet(f"color: {color}; font-size: 11px; background: transparent;")
     
     def center(self):
-        screen = QApplication.primaryScreen().geometry()
-        x = (screen.width() - self.width()) // 2
-        y = (screen.height() - self.height()) // 2
-        self.move(x, y)
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            self.resize(1000, 750)
+            x = (geo.width() - self.width()) // 2 + geo.x()
+            y = (geo.height() - self.height()) // 2 + geo.y()
+            self.move(x, y)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setApplicationName("Alien Encryption")
     window = AlienEncryptionApp()
     window.show()
     sys.exit(app.exec())
